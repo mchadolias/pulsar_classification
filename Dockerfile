@@ -11,7 +11,7 @@ ENV XGBOOST_BUILD_CPU=1
 ENV XGBOOST_BUILD_GPU=0
 
 COPY pyproject.toml uv.lock .python-version README.md LICENSE ./
-COPY scripts/ ./scripts/
+COPY src/ ./src/
 
 RUN uv sync --locked --no-dev
 
@@ -22,6 +22,7 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
+COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY docs/ ./docs/
 COPY deployment/predict.py ./
