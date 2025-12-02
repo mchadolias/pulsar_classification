@@ -1,38 +1,57 @@
+# scripts/run_training.py
+
 """
 Main training pipeline for HTRU2 Pulsar Classification.
-Runs the complete ML pipeline with enhanced imbalance handling.
+
+Features:
+- Imbalance handling & F2-optimised thresholding
+- Model comparison across LR, RF, GBDT, XGBoost
+- tqdm progress bar for model training loop
+- Centralised coloured logging via LoggerManager
+- Poller for collecting metrics/history/curves
+- Optional combined comparison plots via ModelComparisonPlotter
+- Optional dry-run mode to validate wiring without training
 """
 
 import os
 import sys
-import json
-import pandas as pd
-from pathlib import Path
 import argparse
+import json
+import numpy as np
+from pathlib import Path
 
-# Add src to path
+import pandas as pd
+from tqdm import tqdm
+from sklearn.metrics import (
+    roc_curve,
+    average_precision_score,
+    fbeta_score,
+    precision_recall_curve,
+    f1_score,
+)
+
+# Ensure src is on Python path
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from src.config import DataConfig
 from src.data_handler import HTRU2DataHandler
 from src.training import ModelTrainer
+from src.plotter import ModelComparisonPlotter
+from src.poller import Poller
 from src.utils import (
-    setup_logger,
-    log_section_header,
+    LoggerManager,
     check_data_balance,
     save_model_comparison,
     save_test_predictions,
     save_final_results,
     save_training_history,
+    NumpyEncoder,
 )
 
 
-# ---------------------------------------------------------
-# 1. Argument parser
-# ---------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run the HTRU2 Pulsar Classification ML Training Pipeline.",
+        description="HTRU2 Pulsar Classification ML Pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -40,308 +59,310 @@ def parse_args():
         "--config",
         type=str,
         default=None,
-        help=(
-            "Path to a TOML model configuration file. "
-            "If not specified, the script will look for test_model.toml or configs/test_model.toml"
-        ),
+        help="Path to TOML config file (e.g. model.toml).",
+    )
+    parser.add_argument(
+        "--compare-models",
+        action="store_true",
+        help="Generate combined comparison plots after training.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (more verbose output).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run full data pipeline setup without training any models.",
     )
 
     return parser.parse_args()
 
 
-# ---------------------------------------------------------
-# 2. Main
-# ---------------------------------------------------------
-
-
 def main():
-    """Main script to run the complete ML pipeline using existing TOML config."""
     args = parse_args()
 
-    # Setup logger
-    logger, log_filename = setup_logger()
+    log_manager = LoggerManager(log_dir="logs", level=(0 if args.debug else 20))
+    logger = log_manager.get_logger()
+    if args.debug:
+        log_manager.enable_debug()
 
-    # Create output directories
-    output_dirs = [
-        "outputs",
-        "outputs/models",
-        "outputs/metrics",
-        "outputs/predictions",
-        "outputs/plots",
-    ]
-    for dir_path in output_dirs:
-        os.makedirs(dir_path, exist_ok=True)
+    logger.info("Starting HTRU2 Pulsar Classification Pipeline…")
+    logger.info(f"Log file: {log_manager.get_log_path()}")
+    logger.info(f"Working directory: {os.getcwd()}")
 
-    logger.info("Starting HTRU2 Pulsar Classification Pipeline...")
-    logger.info(f"Current working directory: {os.getcwd()}")
-    logger.info(f"Log file: {log_filename}")
-
-    # ---------------------------------------------------------
-    # CONFIG SELECTION LOGIC (ARGPARSE + FALLBACK)
-    # ---------------------------------------------------------
-    if args.config is not None:
+    # -------- Config file selection -------- #
+    if args.config:
         config_path = Path(args.config).expanduser().resolve()
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
         logger.info(f"Using config file from CLI: {config_path}")
     else:
-        # Fallback search logic:
-        default_paths = [Path("test_model.toml"), Path("configs/test_model.toml")]
+        candidates = [
+            "model.toml",
+            "test_model.toml",
+            "configs/model.toml",
+            "configs/test_model.toml",
+        ]
         config_path = None
-        for p in default_paths:
+        for c in candidates:
+            p = Path(c)
             if p.exists():
                 config_path = p.resolve()
                 logger.info(f"Using default config file: {config_path}")
                 break
         if config_path is None:
             raise FileNotFoundError(
-                "No config file provided and no default test_model.toml found."
+                "No config file provided and no default model.toml / test_model.toml found."
             )
 
+    # -------- Data loading & preprocessing -------- #
+    data_config = DataConfig()
+    data_handler = HTRU2DataHandler(data_config, logger)
+
+    log_manager.section("STEP 1: DOWNLOADING DATA")
+    data_handler.download_kaggle()
+
+    log_manager.section("STEP 2: LOADING DATA")
+    df = data_handler.load()
+    logger.info(f"Dataset shape: {df.shape}")
+
+    log_manager.section("STEP 3: PREPROCESSING DATA")
+    df_processed = data_handler.preprocess()
+    logger.info(f"Processed dataset shape: {df_processed.shape}")
+
+    check_data_balance(df_processed, logger=logger)
+
+    log_manager.section("STEP 4: SPLITTING DATA")
+    splits = data_handler.split_train_val_test()
+    data_handler.export_splits()
+
+    target_col = "signal"
+    feature_cols = [c for c in df_processed.columns if c != target_col]
+
+    X_train = splits["train"][feature_cols]
+    y_train = splits["train"][target_col]
+    X_val = splits["val"][feature_cols]
+    y_val = splits["val"][target_col]
+    X_test = splits["test"][feature_cols]
+    y_test = splits["test"][target_col]
+
+    logger.info(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+    # -------- Optional dry-run: stop here -------- #
+    if args.dry_run:
+        log_manager.section("DRY-RUN MODE SUMMARY")
+        logger.info(f"Config path: {config_path}")
+        logger.info("Dataset shapes:")
+        logger.info(f"  Train: {X_train.shape}")
+        logger.info(f"  Val:   {X_val.shape}")
+        logger.info(f"  Test:  {X_test.shape}")
+        logger.info("Feature columns:")
+        for col in feature_cols:
+            logger.info(f"  - {col}")
+        logger.info(
+            "Models to be trained: logistic_regression, random_forest, gradient_boosting, xgboost"
+        )
+        logger.info("Dry run complete — no model training performed. Exiting.")
+        return
+
+    # -------- Trainer -------- #
+    log_manager.section("STEP 5: INITIALIZING TRAINER")
+    trainer = ModelTrainer(str(config_path), logger)
+    trainer.data_cfg["numerical_features"] = feature_cols
+    logger.info(f"Using numerical features: {feature_cols}")
+
+    # Poller instance
+    poller = Poller()
+
+    # Correlation matrix once (for features)
     try:
-        # Load data configuration
-        data_config = DataConfig()
-        logger.info("Data configuration loaded")
+        corr = df_processed[feature_cols].corr().values
+        poller.add_correlation_matrix("features", corr, feature_cols)
+    except Exception as e:
+        logger.warning(f"Could not compute feature correlation matrix: {e}")
 
-        # Initialize data handler
-        data_handler = HTRU2DataHandler(data_config, logger=logger)
+    # -------- Train models with tqdm -------- #
+    log_manager.section("STEP 6: TRAINING MODELS")
 
-        # Step 1: Download data (if needed)
-        log_section_header(logger, "STEP 1: DOWNLOADING DATA")
-        data_handler.download_kaggle()
+    models_to_train = ["logistic_regression", "random_forest", "gradient_boosting", "xgboost"]
+    all_results = {}
+    prediction_history = {}
+    best_f2_score = 0.0
+    best_model_name = None
 
-        # Step 2: Load data
-        log_section_header(logger, "STEP 2: LOADING DATA")
-        df = data_handler.load()
-        logger.info(f"Dataset shape: {df.shape}")
+    for model_name in tqdm(models_to_train, desc="Training Models", colour="green"):
+        log_manager.section(f"TRAINING {model_name.upper()}")
+        logger.info(f"Model: {model_name}")
 
-        # Step 3: Preprocess data
-        log_section_header(logger, "STEP 3: PREPROCESSING DATA")
-        df_processed = data_handler.preprocess()
-        logger.info(f"Processed dataset shape: {df_processed.shape}")
+        try:
+            trainer.train(X_train, y_train, model_name)
 
-        # Check data balance
-        check_data_balance(df_processed, logger=logger)
+            metrics = trainer.evaluate(X_val, y_val, save_plots=True)
+            all_results[model_name] = metrics
+            poller.add_metrics(model_name, metrics)
 
-        # Step 4: Split data
-        log_section_header(logger, "STEP 4: SPLITTING DATA")
-        splits = data_handler.split_train_val_test()
+            opt_key = next((k for k in metrics if k.startswith("optimal_threshold_")), None)
+            opt_metrics = metrics.get(opt_key, metrics)
 
-        # Export data splits
-        logger.info("Exporting data splits...")
-        data_handler.export_splits()
+            logger.info(
+                "Validation (optimal threshold): "
+                f"F2={opt_metrics.get('f2', 0):.4f}, "
+                f"F1={opt_metrics.get('f1', 0):.4f}, "
+                f"Recall={opt_metrics.get('recall', 0):.4f}, "
+                f"Precision={opt_metrics.get('precision', 0):.4f}, "
+                f"ROC-AUC={opt_metrics.get('roc_auc', 0):.4f}, "
+                f"PR-AUC={opt_metrics.get('pr_auc', 0):.4f}"
+            )
 
-        # Prepare features and target
-        log_section_header(logger, "STEP 5: PREPARING FEATURES AND TARGET")
-        target_col = "signal"
-        feature_cols = [col for col in df_processed.columns if col != target_col]
+            # Prediction history
+            y_val_proba = trainer.predict_proba(X_val)[:, 1]
+            thresh = metrics.get("optimal_threshold", trainer.optimal_threshold)
+            y_val_pred = (y_val_proba >= thresh).astype(int)
 
-        X_train = splits["train"][feature_cols]
-        y_train = splits["train"][target_col]
-        X_val = splits["val"][feature_cols]
-        y_val = splits["val"][target_col]
-        X_test = splits["test"][feature_cols]
-        y_test = splits["test"][target_col]
+            hist = {
+                "y_true": y_val.tolist(),
+                "y_proba": y_val_proba.tolist(),
+                "y_pred_opt": y_val_pred.tolist(),
+                "optimal_threshold": float(thresh),
+                "metrics": metrics,
+            }
+            prediction_history[model_name] = hist
+            poller.add_prediction_history(model_name, hist)
 
-        logger.info(f"Training set: {X_train.shape}, {y_train.shape}")
-        logger.info(f"Validation set: {X_val.shape}, {y_val.shape}")
-        logger.info(f"Test set: {X_test.shape}, {y_test.shape}")
+            # Confusion matrix for Poller (from metrics)
+            cm = opt_metrics.get("confusion_matrix", None)
+            if cm is not None:
+                poller.add_confusion_matrix(model_name, cm)
 
-        # Step 6: Initialize model trainer
-        log_section_header(logger, "STEP 6: INITIALIZING MODEL TRAINER")
-
-        # config_path already set by argparse + fallback logic at the top
-        trainer = ModelTrainer(str(config_path), logger=logger)
-        logger.info(f"Model trainer initialized with config: {config_path}")
-
-        # Add numerical features to trainer's data config
-        trainer.data_cfg["numerical_features"] = feature_cols
-        logger.info(f"Using numerical features: {feature_cols}")
-
-        # Step 7: Train models
-        log_section_header(logger, "STEP 7: TRAINING MODELS")
-
-        models_to_train = ["logistic_regression", "random_forest", "gradient_boosting", "xgboost"]
-
-        best_metrics = {}
-        best_model_name = None
-        best_f1_score = 0  # Using F1 for imbalance
-        all_results = {}
-
-        for model_name in models_to_train:
-            log_section_header(logger, f"TRAINING {model_name.upper()}")
-
+            # ROC & PR curves & threshold-F2 curves from validation
             try:
-                # Train the model
-                trainer.train(X_train, y_train, model_name)
+                fpr, tpr, _ = roc_curve(y_val, y_val_proba)
+                auc_val = opt_metrics.get("roc_auc", 0.0)
+                poller.add_roc_curve(model_name, fpr, tpr, auc_val)
 
-                # Evaluate on validation set with threshold optimization
-                metrics = trainer.evaluate(X_val, y_val, save_plots=True)
+                precision, recall, pr_th = precision_recall_curve(y_val, y_val_proba)
+                ap_val = opt_metrics.get(
+                    "pr_auc",
+                    average_precision_score(y_val, y_val_proba),
+                )
+                poller.add_pr_curve(model_name, precision, recall, ap_val)
 
-                logger.info(f"{model_name} Validation Metrics:")
+                thresholds = np.linspace(0.01, 0.99, 100)
 
-                # Log optimal threshold metrics (per-model)
-                optimal_key = None
-                for key in metrics.keys():
-                    if key.startswith("optimal_threshold_"):
-                        optimal_key = key
-                        break
+                f1_scores = [
+                    f1_score(y_val, (y_val_proba >= t).astype(int), zero_division=0)
+                    for t in thresholds
+                ]
+                f2_scores = [
+                    fbeta_score(y_val, (y_val_proba >= t).astype(int), beta=2, zero_division=0)
+                    for t in thresholds
+                ]
 
-                if optimal_key is not None:
-                    opt_metrics = metrics[optimal_key]
-                    logger.info(
-                        f"  Optimal threshold: {metrics.get('optimal_threshold', trainer.optimal_threshold):.3f}"
-                    )
-                    logger.info(f"  F1 Score: {opt_metrics.get('f1', 0):.4f}")
-                    logger.info(f"  Recall: {opt_metrics.get('recall', 0):.4f}")
-                    logger.info(f"  Precision: {opt_metrics.get('precision', 0):.4f}")
-                else:
-                    logger.warning(
-                        f"No optimal_threshold_* key found for {model_name}; falling back to flat metrics."
-                    )
-
-                # Store results
-                all_results[model_name] = metrics
-
-                # Track best model based on F1 score (better for imbalance)
-                if optimal_key is not None:
-                    current_f1 = metrics[optimal_key].get("f1", 0)
-                else:
-                    current_f1 = metrics.get("f1", metrics.get("f1_score", 0))
-
-                if current_f1 > best_f1_score:
-                    best_f1_score = current_f1
-                    best_model_name = model_name
-                    best_metrics = metrics
+                poller.add_threshold_curve(model_name, thresholds, f1_scores, f2_scores)
 
             except Exception as e:
-                logger.error(f"Error training {model_name}: {e}")
-                continue
+                logger.debug(f"Could not compute curves for {model_name}: {e}")
 
-        # Save model comparison results
-        save_model_comparison(all_results, best_model_name, best_f1_score, logger)
+            current_f2 = opt_metrics.get("f2", 0.0)
+            if current_f2 > best_f2_score:
+                best_f2_score = current_f2
+                best_model_name = model_name
 
-        # Display comparison of all models
-        log_section_header(logger, "MODEL COMPARISON SUMMARY")
-        for model_name, metrics in all_results.items():
-            optimal_key = None
-            for key in metrics.keys():
-                if key.startswith("optimal_threshold_"):
-                    optimal_key = key
-                    break
+        except Exception as e:
+            logger.error(f"Training failed for {model_name}: {e}", exc_info=True)
+            continue
 
-            if optimal_key is not None:
-                opt_metrics = metrics[optimal_key]
-            else:
-                opt_metrics = metrics
+    if best_model_name is None:
+        logger.error("No model trained successfully; aborting.")
+        return
 
-            f1 = opt_metrics.get("f1", opt_metrics.get("f1_score", 0))
-            recall = opt_metrics.get("recall", 0)
-            roc_auc = opt_metrics.get("roc_auc", 0)
-            logger.info(
-                f"{model_name:20} | F1: {f1:.4f} | Recall: {recall:.4f} | ROC AUC: {roc_auc:.4f}"
-            )
+    save_model_comparison(all_results, best_model_name, best_f2_score, logger)
 
-        logger.info(f"Best model: {best_model_name} (F1 Score: {best_f1_score:.4f})")
+    # Save raw prediction_history as simple JSON (legacy)
+    history_path_simple = Path("outputs/metrics/model_prediction_history.json")
+    with open(history_path_simple, "w") as f:
+        json.dump(prediction_history, f, indent=2, cls=NumpyEncoder)
+    logger.info(f"Saved model prediction history → {history_path_simple}")
 
-        # Step 8: Final evaluation with best model
-        logger.info(
-            f"Retraining best model ({best_model_name}) on combined training + validation data..."
-        )
+    # -------- Retrain best model on full train+val -------- #
+    log_manager.section("STEP 7: RETRAINING BEST MODEL ON FULL TRAINING DATA")
 
-        # Combine train and validation sets
-        X_full_train = pd.concat([X_train, X_val], axis=0)
-        y_full_train = pd.concat([y_train, y_val], axis=0)
+    X_full_train = pd.concat([X_train, X_val], axis=0)
+    y_full_train = pd.concat([y_train, y_val], axis=0)
 
-        # Retrain best model on full training data
-        trainer.train(X_full_train, y_full_train, best_model_name)
+    logger.info(f"Best model: {best_model_name} (F2 = {best_f2_score:.4f})")
+    trainer.train(X_full_train, y_full_train, best_model_name)
 
-        # Evaluate on test set
-        log_section_header(logger, "FINAL EVALUATION ON TEST SET")
-        test_metrics = trainer.evaluate(X_test, y_test, save_plots=True)
+    # -------- Final test evaluation -------- #
+    log_manager.section("STEP 8: FINAL TEST EVALUATION")
 
-        logger.info("Test Set Metrics (Optimal Threshold):")
-        optimal_key = None
-        for key in test_metrics.keys():
-            if key.startswith("optimal_threshold_"):
-                optimal_key = key
-                break
+    test_metrics = trainer.evaluate(X_test, y_test, save_plots=True)
+    opt_key_test = next((k for k in test_metrics if k.startswith("optimal_threshold_")), None)
+    opt_test_metrics = test_metrics.get(opt_key_test, test_metrics)
 
-        if optimal_key is not None:
-            opt_test_metrics = test_metrics[optimal_key]
-            for metric_name, value in opt_test_metrics.items():
-                if metric_name not in [
-                    "confusion_matrix",
-                    "classification_report",
-                    "confusion_counts",
-                ]:
-                    logger.info(f"  {metric_name}: {value:.4f}")
+    logger.info(
+        "Test (optimal threshold): "
+        f"F2={opt_test_metrics.get('f2', 0):.4f}, "
+        f"F1={opt_test_metrics.get('f1', 0):.4f}, "
+        f"Recall={opt_test_metrics.get('recall', 0):.4f}, "
+        f"Precision={opt_test_metrics.get('precision', 0):.4f}, "
+        f"ROC-AUC={opt_test_metrics.get('roc_auc', 0):.4f}, "
+        f"PR-AUC={opt_test_metrics.get('pr_auc', 0):.4f}"
+    )
+
+    save_test_predictions(trainer, X_test, y_test, best_model_name, logger)
+
+    # -------- Feature importances for best model -------- #
+    log_manager.section("STEP 9: FEATURE IMPORTANCES")
+
+    try:
+        feature_importances = trainer.get_feature_importances(feature_cols)
+        if feature_importances:
+            for feat, imp in sorted(feature_importances.items(), key=lambda x: x[1], reverse=True):
+                logger.info(f"{feat}: {imp:.4f}")
+            poller.add_feature_importances(best_model_name, feature_importances)
         else:
-            logger.warning(
-                "No optimal_threshold_* key found in test_metrics; skipping detailed per-metric log."
-            )
-
-        # Save test predictions
-        save_test_predictions(trainer, X_test, y_test, best_model_name, logger)
-
-        # Step 9: Feature importance (if available)
-        feature_importances = {}
-        try:
-            logger.info("Feature Importances:")
-            importances = trainer.get_feature_importances(feature_cols)
-            for feature, importance in sorted(
-                importances.items(), key=lambda x: x[1], reverse=True
-            ):
-                logger.info(f"  {feature}: {importance:.4f}")
-            feature_importances = importances
-        except ValueError as e:
-            logger.info(f"  Note: {e}")
-            feature_importances = {"error": str(e)}
-
-        # Step 10: Save the model and all outputs
-        log_section_header(logger, "STEP 10: SAVING MODEL AND OUTPUTS")
-
-        # Save the trained model
-        model_save_path = f"outputs/models/best_{best_model_name}_model.pkl"
-        trainer.save_model(model_save_path)
-
-        # Save comprehensive results
-        save_final_results(
-            best_model_name=best_model_name,
-            test_metrics=test_metrics,
-            feature_importances=feature_importances,
-            feature_cols=feature_cols,
-            model_config_path=config_path,
-            logger=logger,
-        )
-
-        # Save training history
-        save_training_history(all_results, best_model_name, data_handler, logger)
-
-        logger.info("Pipeline completed successfully!")
-        logger.info(f"Best model saved as: {model_save_path}")
-        logger.info(f"Best model: {best_model_name}")
-        logger.info(f"Optimal threshold: {trainer.optimal_threshold:.4f}")
-
-        # Log a brief test summary if an optimal-threshold block is available
-        optimal_key = None
-        for key in test_metrics.keys():
-            if key.startswith("optimal_threshold_"):
-                optimal_key = key
-                break
-
-        if optimal_key is not None:
-            opt_metrics = test_metrics[optimal_key]
-            logger.info(f"Test F1 Score: {opt_metrics.get('f1', 0):.4f}")
-            logger.info(f"Test Recall: {opt_metrics.get('recall', 0):.4f}")
-
-        logger.info(f"All outputs saved in: outputs/")
-        logger.info(f"Log file: {log_filename}")
-
+            feature_importances = {}
     except Exception as e:
-        logger.error(f"Pipeline failed with error: {e}")
-        logger.error("Stack trace:", exc_info=True)
-        raise
+        logger.warning(f"Could not compute feature importances: {e}")
+        feature_importances = {}
+
+    # -------- Save final outputs -------- #
+    log_manager.section("STEP 10: SAVING FINAL OUTPUTS")
+
+    model_path = f"outputs/models/best_{best_model_name}.pkl"
+    trainer.save_model(model_path)
+
+    save_final_results(
+        best_model_name,
+        test_metrics,
+        feature_importances,
+        feature_cols,
+        config_path,
+        logger,
+    )
+
+    save_training_history(all_results, best_model_name, data_handler, logger)
+
+    # Save Poller state
+    poller_path = poller.save()
+    logger.info(f"Poller state saved → {poller_path}")
+
+    # -------- Optional combined plots -------- #
+    if args.compare_models:
+        log_manager.section("STEP 11: COMBINED MODEL COMPARISON PLOTS")
+        try:
+            plotter = ModelComparisonPlotter.from_poller_file(str(poller_path))
+            plotter.plot_all(formats=("png", "pdf"))
+            logger.info("Combined comparison plots generated.")
+        except Exception as e:
+            logger.error(f"Failed to generate comparison plots: {e}", exc_info=True)
+
+    logger.info("Pipeline completed successfully.")
+    logger.info(f"Best model: {best_model_name}")
+    logger.info(f"Optimal threshold: {trainer.optimal_threshold:.4f}")
 
 
 if __name__ == "__main__":
