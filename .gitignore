@@ -195,4 +195,4 @@ outputs/models
 outputs/metrics
 outputs/predictions
 outputs/plots/training
-
+outputs/plots/comparison/*.png
