@@ -1,11 +1,19 @@
 """
-Final updated training.py — restores backward compatibility and fixes evaluate signature.
-Features:
-- Automatic numeric feature detection
-- F1 used for GridSearchCV, F2 for threshold optimisation
-- evaluate(save_plots=...) restored for compatibility with existing scripts
-- Robust metric calculations and safe handling for single-class cases
-- Plot generation when save_plots=True
+training.py
+------------
+
+Defines the ModelTrainer class, the central API for model training, validation,
+hyper-parameter search, threshold optimisation, and metric computation.
+
+Main responsibilities:
+    • Build sklearn pipelines with preprocessing + classifier
+    • Run grid/random/halving search (or simple fit)
+    • Compute metrics including ROC, PR-AUC, F1/F2, recall, precision, cost
+    • Compute and store calibration statistics
+    • Produce individual evaluation plots (saved to outputs/plots/training/)
+    • Store threshold curves and evaluation metadata in the Poller
+
+Used by run_training.py as the core training engine.
 """
 
 import pickle
@@ -15,7 +23,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from sklearn.model_selection import GridSearchCV
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+from sklearn.model_selection import (
+    GridSearchCV,
+    RandomizedSearchCV,
+    HalvingGridSearchCV,
+)
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import (
     roc_auc_score,
@@ -27,6 +40,8 @@ from sklearn.metrics import (
     roc_curve,
     precision_recall_curve,
     fbeta_score,
+    average_precision_score,
+    make_scorer,
 )
 from sklearn.linear_model import LogisticRegression
 from sklearn.compose import ColumnTransformer
@@ -39,7 +54,7 @@ from xgboost import XGBClassifier
 class ModelTrainer:
     def __init__(self, config_path: str, logger=None):
         if logger is None:
-            self.logger = logging.getLogger(__name__)
+            self.logger = logging.getLogger("pulsar_ml")
         else:
             self.logger = logger
 
@@ -68,8 +83,9 @@ class ModelTrainer:
         self.metrics_cfg = config.get("metrics", {})
         self.costs_cfg = config.get("costs", {})
 
-        # Use sklearn-compatible metric for GridSearchCV
-        self.scoring_metric = "f1"
+        self.scoring_metric = self.metrics_cfg.get("primary", "f1")
+        self.f2_scorer = make_scorer(fbeta_score, beta=2, average="binary", zero_division=0)
+
         self.optimal_threshold = 0.5
         self.class_weights = None
         self._sample_X_train = None
@@ -79,9 +95,6 @@ class ModelTrainer:
         self.best_model = None
         self.best_model_name = None
 
-    # -----------------------------
-    # Helpers
-    # -----------------------------
     def _convert_nulls(self, obj):
         if isinstance(obj, dict):
             return {k: self._convert_nulls(v) for k, v in obj.items()}
@@ -90,15 +103,11 @@ class ModelTrainer:
         return None if obj in ("null", "None", None) else obj
 
     def set_training_sample(self, X_train):
-        """Store a sample (DataFrame) for automatic feature detection."""
         self._sample_X_train = X_train
 
     def _clean_params(self, d):
         return {k: v for k, v in d.items() if v is not None}
 
-    # -----------------------------
-    # Model initialization
-    # -----------------------------
     def _initialize_models_with_weights(self):
         use_weights = self.data_cfg.get("class_weights", False)
         strategy = self.data_cfg.get("weight_strategy", "balanced")
@@ -139,9 +148,6 @@ class ModelTrainer:
             return 1.0
         return max(1.0, neg / pos)
 
-    # -----------------------------
-    # Pipeline & features
-    # -----------------------------
     def make_pipeline(self, model_name: str):
         if self.data_cfg.get("numerical_features"):
             numerical = self.data_cfg.get("numerical_features")
@@ -156,49 +162,6 @@ class ModelTrainer:
         pipeline = Pipeline([("preprocessor", pre), ("classifier", self.models[model_name])])
         return pipeline
 
-    # -----------------------------
-    # Training
-    # -----------------------------
-    def train(self, X_train, y_train, model_name: str):
-        self.logger.info(f"Starting training for {model_name}...")
-
-        if model_name is None or model_name not in self.models:
-            raise ValueError(f"Unknown model: {model_name}")
-
-        # ensure feature inference sample is set
-        if self._sample_X_train is None:
-            self.set_training_sample(X_train)
-
-        # set XGBoost imbalance parameter
-        scale = self._compute_scale_pos_weight(y_train)
-        if model_name == "xgboost":
-            try:
-                self.models["xgboost"].set_params(scale_pos_weight=scale)
-            except Exception:
-                self.logger.warning("Could not set scale_pos_weight on xgboost model")
-
-        pipeline = self.make_pipeline(model_name)
-        param_grid = self._clean_param_grid(self.param_grids.get(model_name, {}))
-
-        if param_grid:
-            grid = GridSearchCV(
-                estimator=pipeline,
-                param_grid={f"classifier__{k}": v for k, v in param_grid.items()},
-                scoring=self.scoring_metric,
-                cv=self.cv_cfg.get("folds", 3),
-                n_jobs=self.training_cfg.get("n_jobs", -1),
-                verbose=self.training_cfg.get("verbose", 1),
-            )
-            grid.fit(X_train, y_train)
-            self.best_model = grid.best_estimator_
-            self.logger.info(f"GridSearchCV best score: {grid.best_score_}")
-        else:
-            pipeline.fit(X_train, y_train)
-            self.best_model = pipeline
-
-        self.best_model_name = model_name
-        self.logger.info(f"Training complete for {model_name}")
-
     def _clean_param_grid(self, grid):
         cleaned = {}
         for k, v in grid.items():
@@ -210,26 +173,89 @@ class ModelTrainer:
                 cleaned[k] = v
         return cleaned
 
-    # -----------------------------
-    # Evaluation (backward-compatible)
-    # -----------------------------
+    def train(self, X_train, y_train, model_name: str):
+        self.logger.info(f"Starting training for {model_name}...")
+
+        if model_name is None or model_name not in self.models:
+            raise ValueError(f"Unknown model: {model_name}")
+
+        if self._sample_X_train is None:
+            self.set_training_sample(X_train)
+
+        scale = self._compute_scale_pos_weight(y_train)
+        if model_name == "xgboost":
+            try:
+                self.models["xgboost"].set_params(scale_pos_weight=scale)
+            except Exception:
+                self.logger.warning("Could not set scale_pos_weight on xgboost model")
+
+        pipeline = self.make_pipeline(model_name)
+        param_grid = self._clean_param_grid(self.param_grids.get(model_name, {}))
+
+        search_mode = self.training_cfg.get("search", "grid").lower()
+        score_function = (
+            self.f2_scorer if str(self.scoring_metric).lower() == "f2" else self.scoring_metric
+        )
+        param_grid_prefixed = {f"classifier__{k}": v for k, v in param_grid.items()}
+
+        if param_grid:
+            if search_mode == "random":
+                self.logger.info("Using RandomizedSearchCV")
+                search = RandomizedSearchCV(
+                    estimator=pipeline,
+                    param_distributions=param_grid_prefixed,
+                    n_iter=int(self.training_cfg.get("random_iters", 40)),
+                    scoring=score_function,
+                    cv=int(self.cv_cfg.get("folds", 5)),
+                    n_jobs=self.training_cfg.get("n_jobs", -1),
+                    verbose=self.training_cfg.get("verbose", 1),
+                    random_state=self.cv_cfg.get("random_state", 42),
+                )
+
+            elif search_mode == "halving":
+                self.logger.info("Using HalvingGridSearchCV (successive halving)")
+                search = HalvingGridSearchCV(
+                    estimator=pipeline,
+                    param_grid=param_grid_prefixed,
+                    factor=3,
+                    scoring=score_function,
+                    cv=int(self.cv_cfg.get("folds", 5)),
+                    verbose=self.training_cfg.get("verbose", 1),
+                    n_jobs=self.training_cfg.get("n_jobs", -1),
+                )
+
+            else:
+                self.logger.info("Using GridSearchCV")
+                search = GridSearchCV(
+                    estimator=pipeline,
+                    param_grid=param_grid_prefixed,
+                    scoring=score_function,
+                    cv=int(self.cv_cfg.get("folds", 5)),
+                    n_jobs=self.training_cfg.get("n_jobs", -1),
+                    verbose=self.training_cfg.get("verbose", 1),
+                )
+
+            search.fit(X_train, y_train)
+            self.best_model = search.best_estimator_
+            self.logger.info(f"Best CV score: {search.best_score_:.4f}")
+        else:
+            self.logger.info("No parameter grid, performing simple fit")
+            pipeline.fit(X_train, y_train)
+            self.best_model = pipeline
+
+        self.best_model_name = model_name
+        self.logger.info(f"Training complete for {model_name}")
+
     def evaluate(self, X_test, y_test, save_plots: bool = False):
-        """
-        Evaluate model and return a metrics dict. Kept backward-compatible keys that
-        the rest of your pipeline expects.
-        """
         if self.best_model is None:
             raise ValueError("No model has been trained yet. Call train() first.")
 
-        # predict probabilities safely
         try:
             y_proba = self.best_model.predict_proba(X_test)[:, 1]
         except Exception:
-            # Some models may not implement predict_proba; fallback to predict
             y_pred_only = self.best_model.predict(X_test)
             y_proba = np.array(y_pred_only, dtype=float)
 
-        # optimise threshold using configured F-beta metric (default: F2)
         if self.threshold_cfg.get("optimization", True):
             self.optimal_threshold = self._optimize_threshold(y_test, y_proba)
         else:
@@ -248,23 +274,21 @@ class ModelTrainer:
             "model_name": self.best_model_name,
         }
 
-        # add backward-compatible flat keys (most-used)
         opt = optimal_metrics
         metrics["roc_auc"] = float(opt.get("roc_auc", 0.0))
+        metrics["pr_auc"] = float(opt.get("pr_auc", 0.0))
         metrics["f1"] = float(opt.get("f1", 0.0))
         metrics["f1_score"] = float(opt.get("f1", 0.0))
         metrics["recall"] = float(opt.get("recall", 0.0))
         metrics["precision"] = float(opt.get("precision", 0.0))
         metrics["f2"] = float(opt.get("f2", 0.0))
 
-        # store calibration data
         try:
             self._calculate_calibration(y_test, y_proba)
             metrics["calibration"] = self.calibration_data
         except Exception as e:
             self.logger.debug(f"Calibration failed: {e}")
 
-        # generate plots if asked
         if save_plots:
             try:
                 self._generate_evaluation_plots(y_test, y_proba, y_pred_opt)
@@ -276,15 +300,13 @@ class ModelTrainer:
     def _optimize_threshold(self, y_true, y_proba):
         method = self.threshold_cfg.get("method", "precision_recall")
         num_thresholds = int(self.threshold_cfg.get("num_thresholds", 50))
+        beta = float(self.threshold_cfg.get("beta", 2.0))
 
         if method == "precision_recall":
             precision, recall, pr_thresholds = precision_recall_curve(y_true, y_proba)
-            beta = float(self.threshold_cfg.get("beta", 1.0))
-            # compute F-beta for each (precision, recall) pair
             f_scores = (
                 (1 + beta**2) * (precision * recall) / ((beta**2 * precision) + recall + 1e-12)
             )
-            # pr_thresholds length = len(precision)-1, align indices
             best_idx = int(np.nanargmax(f_scores[:-1])) if len(f_scores) > 1 else 0
             best_threshold = (
                 pr_thresholds[min(best_idx, len(pr_thresholds) - 1)]
@@ -293,11 +315,9 @@ class ModelTrainer:
             )
             return float(best_threshold)
 
-        # fallback simple grid search on F-beta
         thresholds = np.linspace(0.01, 0.99, num_thresholds)
         best_th = 0.5
         best_score = -1
-        beta = float(self.threshold_cfg.get("beta", 1.0))
         for t in thresholds:
             y_pred = (y_proba >= t).astype(int)
             score = fbeta_score(y_true, y_pred, beta=beta, zero_division=0)
@@ -307,21 +327,23 @@ class ModelTrainer:
         return best_th
 
     def _calculate_metrics(self, y_true, y_pred, y_proba=None):
-        # safe roc
         if y_proba is not None and len(np.unique(y_true)) == 2:
             try:
                 roc = float(roc_auc_score(y_true, y_proba))
             except Exception:
                 roc = 0.0
+            try:
+                pr_auc = float(average_precision_score(y_true, y_proba))
+            except Exception:
+                pr_auc = 0.0
         else:
             roc = 0.0
+            pr_auc = 0.0
 
-        # safe confusion matrix with explicit labels
         cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
         if cm.shape == (2, 2):
             tn, fp, fn, tp = cm.ravel()
         else:
-            # fallback
             tn = int(cm[0, 0]) if cm.size > 0 else 0
             fp = fn = tp = 0
 
@@ -330,7 +352,6 @@ class ModelTrainer:
         f1 = float(f1_score(y_true, y_pred, zero_division=0))
         f2 = float(fbeta_score(y_true, y_pred, beta=2, zero_division=0))
 
-        # classification report
         try:
             report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
         except Exception:
@@ -342,6 +363,7 @@ class ModelTrainer:
 
         return {
             "roc_auc": roc,
+            "pr_auc": pr_auc,
             "precision": prec,
             "recall": rec,
             "f1": f1,
@@ -359,21 +381,29 @@ class ModelTrainer:
             "prob_pred": [float(x) for x in prob_pred.tolist()],
         }
 
-    def _generate_evaluation_plots(self, y_true, y_proba, y_pred):
-        output_dir = Path("outputs/plots")
+    def _generate_evaluation_plots(self, y_true, y_proba, y_pred_opt=None):
+        """
+        Generate ROC, Precision–Recall, and Threshold (F1/F2) curves
+        during training evaluation. Also stores threshold curves in the Poller.
+        The third parameter is accepted for backward compatibility.
+        """
+        output_dir = Path("outputs/plots/training")
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # ROC
+        # ======================================================
+        # 1) ROC Curve
+        # ======================================================
         if len(np.unique(y_true)) == 2:
             try:
                 fpr, tpr, _ = roc_curve(y_true, y_proba)
                 auc_score = roc_auc_score(y_true, y_proba)
+
                 plt.figure(figsize=(6, 5))
-                plt.plot(fpr, tpr, label=f"ROC (AUC={auc_score:.3f})")
+                plt.plot(fpr, tpr, label=f"AUC = {auc_score:.3f}")
                 plt.plot([0, 1], [0, 1], "k--")
                 plt.xlabel("False Positive Rate")
                 plt.ylabel("True Positive Rate")
-                plt.title(f"ROC - {self.best_model_name}")
+                plt.title(f"ROC Curve – {self.best_model_name}")
                 plt.legend()
                 plt.savefig(
                     output_dir / f"roc_{self.best_model_name}.png", dpi=150, bbox_inches="tight"
@@ -382,14 +412,19 @@ class ModelTrainer:
             except Exception as e:
                 self.logger.debug(f"ROC plot failed: {e}")
 
-        # Precision-Recall
+        # ======================================================
+        # 2) Precision–Recall Curve
+        # ======================================================
         try:
             precision, recall, _ = precision_recall_curve(y_true, y_proba)
+            pr_auc = average_precision_score(y_true, y_proba)
+
             plt.figure(figsize=(6, 5))
-            plt.plot(recall, precision)
+            plt.plot(recall, precision, label=f"AP = {pr_auc:.3f}")
             plt.xlabel("Recall")
             plt.ylabel("Precision")
-            plt.title(f"Precision-Recall - {self.best_model_name}")
+            plt.title(f"Precision–Recall – {self.best_model_name}")
+            plt.legend()
             plt.savefig(
                 output_dir / f"pr_{self.best_model_name}.png", dpi=150, bbox_inches="tight"
             )
@@ -397,48 +432,62 @@ class ModelTrainer:
         except Exception as e:
             self.logger.debug(f"PR plot failed: {e}")
 
-        # Threshold analysis
+        thresholds, f1_scores, f2_scores = None, None, None
+
+        # ======================================================
+        # 3) Threshold analysis (F1 and F2)
+        # ======================================================
         try:
             thresholds = np.linspace(0.01, 0.99, 100)
-            f1_scores = [
-                f1_score(y_true, (y_proba >= t).astype(int), zero_division=0) for t in thresholds
-            ]
-            f2_scores = [
-                fbeta_score(y_true, (y_proba >= t).astype(int), beta=2, zero_division=0)
-                for t in thresholds
-            ]
+            f1_scores = []
+            f2_scores = []
+
+            for t in thresholds:
+                preds_t = (y_proba >= t).astype(int)
+                f1_scores.append(f1_score(y_true, preds_t, zero_division=0))
+                f2_scores.append(fbeta_score(y_true, preds_t, beta=2, zero_division=0))
 
             plt.figure(figsize=(6, 5))
-            plt.plot(thresholds, f1_scores, label="F1")
+            plt.plot(thresholds, f1_scores, linestyle="--", label="F1")
             plt.plot(thresholds, f2_scores, label="F2")
             plt.axvline(
                 self.optimal_threshold,
                 color="r",
                 linestyle="--",
-                label=f"Optimal {self.optimal_threshold:.3f}",
+                label=f"Optimal = {self.optimal_threshold:.3f}",
             )
-            plt.axvline(0.5, color="g", linestyle="--", label="Default 0.5")
+            plt.axvline(0.5, color="g", linestyle="--", label="Default = 0.5")
             plt.xlabel("Threshold")
             plt.ylabel("Score")
-            plt.title(f"Threshold analysis - {self.best_model_name}")
+            plt.title(f"Threshold Analysis – {self.best_model_name}")
             plt.legend()
             plt.savefig(
                 output_dir / f"threshold_{self.best_model_name}.png", dpi=150, bbox_inches="tight"
             )
             plt.close()
-        except Exception as e:
-            self.logger.debug(f"Threshold plot failed: {e}")
 
-    # -----------------------------
-    # Utilities
-    # -----------------------------
+        except Exception as e:
+            self.logger.debug(f"Threshold analysis plot failed: {e}")
+
+        # ======================================================
+        # 4) Store threshold curves in Poller (always)
+        # ======================================================
+        try:
+            if thresholds is not None:
+                self.poller.add_threshold_curve(
+                    self.best_model_name, thresholds, f1_scores, f2_scores
+                )
+        except Exception as e:
+            self.logger.debug(f"Saving threshold curves failed: {e}")
+
+        self.logger.debug("Generated evaluation plots and threshold data.")
+
     def predict_with_threshold(self, X, threshold=None):
         if self.best_model is None:
             raise ValueError("No model has been trained yet. Call train() first.")
         if threshold is None:
             threshold = self.optimal_threshold
 
-        # Try to obtain calibrated probabilities; fall back to hard predictions if needed
         try:
             proba = self.best_model.predict_proba(X)[:, 1]
         except Exception:
@@ -458,8 +507,15 @@ class ModelTrainer:
                 if feature_names is None or len(feature_names) != len(importances):
                     feature_names = [f"feature_{i}" for i in range(len(importances))]
                 return dict(zip(feature_names, importances))
+            elif hasattr(model, "coef_"):
+                coefs = model.coef_
+                if coefs.ndim == 2:
+                    coefs = coefs[0]
+                if feature_names is None or len(feature_names) != len(coefs):
+                    feature_names = [f"feature_{i}" for i in range(len(coefs))]
+                return dict(zip(feature_names, coefs))
             else:
-                self.logger.warning("Model does not expose feature_importances_")
+                self.logger.warning("Model does not expose feature_importances_ or coef_")
                 return {}
         except Exception as e:
             self.logger.error(f"Failed to extract feature importances: {e}")

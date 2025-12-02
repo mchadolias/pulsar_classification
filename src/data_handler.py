@@ -1,4 +1,20 @@
-# scripts/data_handler.py
+"""
+data_handler.py
+----------------
+
+Contains HTRU2DataHandler, responsible for the full data pipeline:
+
+    • Download HTRU2 dataset from Kaggle (if missing)
+    • Load raw CSV into pandas
+    • Rename columns to meaningful names
+    • Validate missing values
+    • Round numerical columns
+    • Split the dataset into train/val/test
+    • Export cleaned data and splits
+
+This module isolates all data-loading details from the ML training code.
+"""
+
 import os
 import pandas as pd
 import logging
@@ -112,7 +128,7 @@ class HTRU2DataHandler:
             self.logger.error(error_msg)
             raise FileNotFoundError(error_msg)
 
-        self.logger.info(f"  Reading from: {self.data_file}")
+        self.logger.info(f"Reading from: {self.data_file}")
 
         try:
             # No header in original dataset
@@ -123,7 +139,7 @@ class HTRU2DataHandler:
             self.logger.info(f"Columns: {self.df.shape[1]}")
             self.logger.info(f"Rows: {self.df.shape[0]}")
             self.logger.info(
-                f"  Memory usage: {self.df.memory_usage(deep=True).sum() / 1024**2:.2f} MB"
+                f"Memory usage: {self.df.memory_usage(deep=True).sum() / 1024**2:.2f} MB"
             )
 
             # Log basic info about the raw data
@@ -175,7 +191,7 @@ class HTRU2DataHandler:
             self.logger.info("Renaming columns...")
             self.logger.debug(f"New column names: {COLUMN_NAMES}")
             self.df.columns = COLUMN_NAMES
-            self.logger.info("[SUCCESS] Columns renamed")
+            self.logger.info("Columns renamed")
 
             # Check for missing values
             self.logger.info("Checking for missing values...")
@@ -186,7 +202,7 @@ class HTRU2DataHandler:
                 for col, missing_count in missing_details[missing_details > 0].items():
                     self.logger.error(f"    {col}: {missing_count} missing values")
                 raise ValueError("Dataset contains missing values.")
-            self.logger.info("[SUCCESS] No missing values found")
+            self.logger.info("No missing values found")
 
             # Get numerical columns and apply rounding
             numerical_cols, _ = self.get_column_types()
@@ -202,9 +218,9 @@ class HTRU2DataHandler:
                 )
 
             self.df[numerical_cols] = self.df[numerical_cols].apply(lambda x: round(x, 3))
-            self.logger.info("[SUCCESS] Numerical values rounded")
+            self.logger.info("Numerical values rounded")
 
-            self.logger.info("[SUCCESS] Preprocessing complete.")
+            self.logger.info("Preprocessing complete.")
             self.logger.info(f"Final shape: {self.df.shape}")
             self.logger.debug(f"Processed data sample:\n{self.df.head(2)}")
 
@@ -252,7 +268,7 @@ class HTRU2DataHandler:
             }
 
             # Log split statistics
-            self.logger.info("[SUCCESS] Data splitting complete.")
+            self.logger.info("Data splitting complete.")
             self.logger.info("Split Statistics:")
             for split_name, df_split in self.splits.items():
                 split_size = len(df_split)
@@ -286,12 +302,12 @@ class HTRU2DataHandler:
                 df_split.to_csv(file_path, index=False)
                 exported_files.append(file_path)
                 self.logger.info(
-                    f"[SUCCESS] Exported {split_name} set to ./data/processed/{split_name}_data.csv"
+                    f"Exported {split_name} set to ./data/processed/{split_name}_data.csv"
                 )
                 self.logger.debug(f"    {split_name} shape: {df_split.shape}")
 
-            self.logger.info("[SUCCESS] All data splits exported successfully.")
-            self.logger.info(f"  Total files exported: {len(exported_files)}")
+            self.logger.info("All data splits exported successfully.")
+            self.logger.info(f"Total files exported: {len(exported_files)}")
 
         except Exception as e:
             self.logger.error(f"[ERROR] Error exporting data splits: {e}")
@@ -310,7 +326,7 @@ class HTRU2DataHandler:
             file_path = os.path.join(self.processed_dir, "HTRU2_cleaned_data.csv")
             self.df.to_csv(file_path, index=False)
 
-            self.logger.info("[SUCCESS] Exported cleaned data to {file_path}.")
+            self.logger.info("Exported cleaned data to {file_path}.")
             self.logger.info(f"  File size: {os.path.getsize(file_path) / 1024**2:.2f} MB")
             self.logger.info(f"  Dataset shape: {self.df.shape}")
 

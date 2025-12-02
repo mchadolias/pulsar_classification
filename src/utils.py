@@ -1,76 +1,164 @@
-from pathlib import Path
-import json
+"""
+utils.py
+---------
+
+Utility helpers for logging, JSON-safe encoding, metrics export, and
+experiment bookkeeping.
+
+Provides:
+    • ColorFormatter + LoggerManager for clean CLI logs
+    • NumpyEncoder to serialize numpy/pandas types into JSON
+    • Helpers to save:
+         - model comparisons
+         - test predictions
+         - training history
+         - data balance diagnostics
+
+This module contains no ML logic—only IO, logging, and convenience utilities
+used by the training and plotting pipelines.
+"""
+
 import logging
-from datetime import datetime
-import pandas as pd
-import numpy as np
 import os
-from typing import Dict, Any, Optional
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+
+import numpy as np
+import pandas as pd
 
 
-def setup_logger():
-    """Set up logging to both console and file."""
-    # Create logs directory
-    os.makedirs("logs", exist_ok=True)
-
-    # Create logger
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-
-    # Clear any existing handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-
-    # Create formatter
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    # File handler
-    log_filename = f"logs/pulsar_classification_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    file_handler = logging.FileHandler(log_filename)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    return logger, log_filename
+# ----------------- Colour logging ----------------- #
 
 
-def log_section_header(logger, title):
-    """Log a formatted section header."""
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info(f" {title}")
-    logger.info("=" * 60)
+class ColorFormatter(logging.Formatter):
+    """
+    Subtle coloured formatter for console logging.
+    - INFO:    soft cyan
+    - WARNING: soft yellow
+    - ERROR:   soft red
+    - DEBUG:   dim gray/magenta
+    Only the level name is coloured; file logs stay plain.
+    """
+
+    RESET = "\033[0m"
+    COLORS = {
+        logging.DEBUG: "\033[38;5;244m",
+        logging.INFO: "\033[38;5;37m",
+        logging.WARNING: "\033[38;5;178m",
+        logging.ERROR: "\033[38;5;167m",
+        logging.CRITICAL: "\033[1;38;5;196m",
+    }
+
+    def format(self, record):
+        original_levelname = record.levelname
+        color = self.COLORS.get(record.levelno, "")
+        if color:
+            record.levelname = f"{color}{record.levelname}{self.RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
+
+
+class LoggerManager:
+    """
+    Centralised logging manager for the entire ML pipeline.
+
+    - Console + file logging
+    - Subtle coloured levels on console
+    - Section headers
+    - Debug mode switch
+    """
+
+    def __init__(self, log_dir: str = "logs", level: int = logging.INFO, use_colors: bool = True):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = self.log_dir / f"pulsar_classification_{timestamp}.log"
+
+        self.logger = logging.getLogger("pulsar_ml")
+        self.logger.setLevel(level)
+
+        # Remove existing handlers for repeated runs
+        if self.logger.handlers:
+            for h in list(self.logger.handlers):
+                self.logger.removeHandler(h)
+
+        fmt = "%(asctime)s - %(levelname)s - %(message)s"
+        datefmt = "%Y-%m-%d %H:%M:%S"
+
+        console_formatter = (
+            ColorFormatter(fmt=fmt, datefmt=datefmt)
+            if use_colors
+            else logging.Formatter(fmt=fmt, datefmt=datefmt)
+        )
+        file_formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
+
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(console_formatter)
+        self.logger.addHandler(console_handler)
+
+        file_handler = logging.FileHandler(self.log_file)
+        file_handler.setLevel(level)
+        file_handler.setFormatter(file_formatter)
+        self.logger.addHandler(file_handler)
+
+    def section(self, title: str):
+        self.logger.info("")
+        self.logger.info("=" * 70)
+        self.logger.info(f" {title}")
+        self.logger.info("=" * 70)
+
+    def get_logger(self) -> logging.Logger:
+        return self.logger
+
+    def get_log_path(self) -> str:
+        return str(self.log_file)
+
+    def enable_debug(self):
+        self.logger.setLevel(logging.DEBUG)
+        for h in self.logger.handlers:
+            h.setLevel(logging.DEBUG)
+        self.logger.debug("Debug logging enabled.")
+
+    def disable_debug(self):
+        self.logger.setLevel(logging.INFO)
+        for h in self.logger.handlers:
+            h.setLevel(logging.INFO)
+        self.logger.info("Debug logging disabled.")
+
+
+# ----------------- JSON encoder ----------------- #
 
 
 class NumpyEncoder(json.JSONEncoder):
-    """Custom JSON encoder for numpy data types."""
+    """Custom JSON encoder for numpy/pandas/types, Paths, datetimes."""
 
     def default(self, obj):
-        if isinstance(obj, (np.integer, np.int64, np.int32, int)):
+        if isinstance(obj, (np.integer,)):
             return int(obj)
-        elif isinstance(obj, (np.floating, np.float64, np.float32, float)):
+        if isinstance(obj, (np.floating,)):
             return float(obj)
-        elif isinstance(obj, (np.bool_, bool)):
+        if isinstance(obj, (np.bool_, bool)):
             return bool(obj)
-        elif isinstance(obj, (Path,)):
-            return str(obj)
-        elif isinstance(obj, (np.ndarray,)):
+        if isinstance(obj, (np.ndarray,)):
             return obj.tolist()
-        elif isinstance(obj, (pd.Timestamp, datetime)):
+        if isinstance(obj, (pd.Timestamp, datetime)):
             return obj.isoformat()
-        elif hasattr(obj, "tolist"):
+        if isinstance(obj, Path):
+            return str(obj)
+        if hasattr(obj, "tolist"):
             return obj.tolist()
-        elif isinstance(obj, dict):
+        if isinstance(obj, dict):
             return {str(k): self.default(v) for k, v in obj.items()}
-        return super(NumpyEncoder, self).default(obj)
+        return super().default(obj)
+
+
+# ----------------- Metric / output helpers ----------------- #
 
 
 def save_model_comparison(all_results, best_model_name, best_score, logger):
@@ -85,7 +173,6 @@ def save_model_comparison(all_results, best_model_name, best_score, logger):
     }
 
     for model_name, metrics in all_results.items():
-        # Get optimal metrics (they're nested under optimal_threshold_X.XXX)
         optimal_key = None
         for key in metrics.keys():
             if key.startswith("optimal_threshold_"):
@@ -100,47 +187,43 @@ def save_model_comparison(all_results, best_model_name, best_score, logger):
                 "recall": float(opt_metrics.get("recall", 0)),
                 "precision": float(opt_metrics.get("precision", 0)),
                 "roc_auc": float(opt_metrics.get("roc_auc", 0)),
+                "pr_auc": float(opt_metrics.get("pr_auc", 0)),
                 "f2": float(opt_metrics.get("f2", 0)),
             }
         else:
-            # Fallback to flat structure if available
             comparison["all_models"][model_name] = {
                 "optimal_threshold": float(metrics.get("optimal_threshold", 0.5)),
                 "f1": float(metrics.get("f1", metrics.get("f1_score", 0))),
                 "recall": float(metrics.get("recall", 0)),
                 "precision": float(metrics.get("precision", 0)),
                 "roc_auc": float(metrics.get("roc_auc", 0)),
+                "pr_auc": float(metrics.get("pr_auc", 0)),
                 "f2": float(metrics.get("f2", 0)),
             }
 
     with open(metrics_dir / "model_comparison.json", "w") as f:
         json.dump(comparison, f, indent=2, cls=NumpyEncoder)
 
-    logger.info(f"[SUCCESS] Model comparison saved to {metrics_dir}/model_comparison.json")
+    logger.info(f"Model comparison saved to {metrics_dir}/model_comparison.json")
 
 
 def save_test_predictions(trainer, X_test, y_test, best_model_name, logger):
     """Save test set predictions."""
-    # Create predictions directory
     predictions_dir = Path("outputs/predictions")
     predictions_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Get predictions
         y_pred = trainer.predict(X_test)
         y_pred_proba = trainer.predict_proba(X_test)[:, 1]
 
-        # Create predictions DataFrame
         predictions_df = X_test.copy() if hasattr(X_test, "copy") else pd.DataFrame(X_test)
         predictions_df["true_label"] = y_test.values if hasattr(y_test, "values") else y_test
         predictions_df["predicted_label"] = y_pred
         predictions_df["predicted_probability"] = y_pred_proba
 
-        # Save predictions
         predictions_file = predictions_dir / f"{best_model_name}_test_predictions.csv"
         predictions_df.to_csv(predictions_file, index=False)
 
-        # Save prediction probabilities only
         proba_df = pd.DataFrame(
             {
                 "true_label": y_test.values if hasattr(y_test, "values") else y_test,
@@ -150,7 +233,7 @@ def save_test_predictions(trainer, X_test, y_test, best_model_name, logger):
         proba_file = predictions_dir / f"{best_model_name}_prediction_probabilities.csv"
         proba_df.to_csv(proba_file, index=False)
 
-        logger.info(f"[SUCCESS] Test predictions saved to {predictions_dir}/")
+        logger.info(f"Test predictions saved to {predictions_dir}/")
 
     except Exception as e:
         logger.error(f"Failed to save test predictions: {e}")
@@ -161,18 +244,16 @@ def save_final_results(
     test_metrics: Dict[str, Any],
     feature_importances: Dict[str, float],
     feature_cols: list,
-    model_config_path: str,
+    model_config_path,
     logger: logging.Logger,
 ) -> None:
     """Save comprehensive final results."""
     results_dir = Path("outputs/metrics")
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract metrics from nested structure
     optimal_metrics = {}
     default_metrics = {}
 
-    # Find optimal threshold metrics
     for key in test_metrics.keys():
         if key.startswith("optimal_threshold_"):
             optimal_metrics = test_metrics[key]
@@ -180,10 +261,10 @@ def save_final_results(
         elif key == "default_threshold_0.5":
             default_metrics = test_metrics[key]
 
-    # If no optimal metrics found, use flat structure
     if not optimal_metrics:
         optimal_metrics = {
             "roc_auc": float(test_metrics.get("roc_auc", 0)),
+            "pr_auc": float(test_metrics.get("pr_auc", 0)),
             "f1": float(test_metrics.get("f1", test_metrics.get("f1_score", 0))),
             "recall": float(test_metrics.get("recall", 0)),
             "precision": float(test_metrics.get("precision", 0)),
@@ -203,14 +284,14 @@ def save_final_results(
         "timestamp": datetime.now().isoformat(),
     }
 
-    # Log summary
     logger.info("Final Test Metrics Summary:")
     logger.info(f"  Optimal threshold: {final_results['optimal_threshold']:.3f}")
-    if optimal_metrics:
-        logger.info(f"  F1 Score: {optimal_metrics.get('f1', 0):.4f}")
-        logger.info(f"  Recall: {optimal_metrics.get('recall', 0):.4f}")
-        logger.info(f"  Precision: {optimal_metrics.get('precision', 0):.4f}")
-        logger.info(f"  ROC AUC: {optimal_metrics.get('roc_auc', 0):.4f}")
+    logger.info(f"  F2 Score: {optimal_metrics.get('f2', 0):.4f}")
+    logger.info(f"  F1 Score: {optimal_metrics.get('f1', 0):.4f}")
+    logger.info(f"  Recall: {optimal_metrics.get('recall', 0):.4f}")
+    logger.info(f"  Precision: {optimal_metrics.get('precision', 0):.4f}")
+    logger.info(f"  ROC AUC: {optimal_metrics.get('roc_auc', 0):.4f}")
+    logger.info(f"  PR  AUC: {optimal_metrics.get('pr_auc', 0):.4f}")
 
     results_file = results_dir / "final_results.json"
     with open(results_file, "w") as f:
@@ -229,13 +310,12 @@ def save_training_history(
     processed_results = {}
     for model_name, metrics in all_results.items():
         processed_metrics = {"optimal_threshold": float(metrics.get("optimal_threshold", 0.5))}
-
-        # Extract optimal metrics
         for key in metrics.keys():
             if key.startswith("optimal_threshold_"):
                 opt_metrics = metrics[key]
                 processed_metrics["optimal"] = {
                     "roc_auc": float(opt_metrics.get("roc_auc", 0)),
+                    "pr_auc": float(opt_metrics.get("pr_auc", 0)),
                     "f1": float(opt_metrics.get("f1", 0)),
                     "recall": float(opt_metrics.get("recall", 0)),
                     "precision": float(opt_metrics.get("precision", 0)),
@@ -243,10 +323,10 @@ def save_training_history(
                 }
                 break
 
-        # Fallback to flat metrics
         if "optimal" not in processed_metrics:
             processed_metrics["optimal"] = {
                 "roc_auc": float(metrics.get("roc_auc", 0)),
+                "pr_auc": float(metrics.get("pr_auc", 0)),
                 "f1": float(metrics.get("f1", metrics.get("f1_score", 0))),
                 "recall": float(metrics.get("recall", 0)),
                 "precision": float(metrics.get("precision", 0)),
@@ -275,14 +355,13 @@ def save_training_history(
         json.dump(history, f, indent=2, cls=NumpyEncoder)
 
     logger.info(f"Training history saved to {history_file}")
-    logger.info("[SUCCESS] Training history saved")
+    logger.info("Training history saved")
 
 
 def check_data_balance(df, target_col="signal", logger=None):
-    """Check the balance of the target variable."""
-    # If no logger provided, use the default logger
+    """Check the balance of the target variable and save to JSON."""
     if logger is None:
-        logger = logging.getLogger()
+        logger = logging.getLogger("pulsar_ml")
 
     logger.info("Data Balance Check:")
 
@@ -294,14 +373,10 @@ def check_data_balance(df, target_col="signal", logger=None):
             percentage = percentages[value]
             logger.info(f"  Class {value}: {count} samples ({percentage:.2f}%)")
 
-        # Save data balance info
-        # For binary and multi-class problems, consider the data imbalanced if the gap
-        # between the most and least frequent classes exceeds 20 percentage points.
         if len(percentages) >= 2:
             imbalance_gap = float(percentages.max() - percentages.min())
             is_imbalanced = bool(imbalance_gap > 20.0)
         else:
-            # Single-class data is by definition extremely imbalanced
             imbalance_gap = 100.0
             is_imbalanced = True
 
