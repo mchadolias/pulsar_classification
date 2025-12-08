@@ -2,8 +2,8 @@ name: Multi-Stage Docker Deployment
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - "v*.*.*"
 
 env:
   REGISTRY_GHCR: ghcr.io
