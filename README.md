@@ -41,6 +41,8 @@ Pulsars are rare neutron stars that produce valuable scientific data. Manual cla
 * **Target**: Binary classification (0 = non-pulsar, 1 = pulsar)
 * **Class Distribution**: Highly imbalanced (~90.84% non-pulsars, ~9.16% pulsars)
 
+![](./outputs/plots/kaggle/label_countplot.png)
+
 ### Dataset Features
 
 The HTRU2 dataset contains 8 features derived from the integrated pulse profile and DM-SNR curve:
@@ -280,19 +282,28 @@ max_depth = 10
 
 ## 📈 Model Performance
 
-**Best Model:** XGBoost
-**ROC-AUC:** 0.9768
-**F1-score:** 0.8927
-**Recall:** 0.8628
-**Precision:** 0.925
+**Selected best model:** Random Forest (recall-focused, F₂-optimised)
 
-Top 3 Features:
+**Test set performance (optimal threshold ≈ 0.36)**
+
+- F₂-score: **0.8923**
+- F₁-score: **0.8819**
+- Recall: **0.8994**
+- Precision: **0.8651**
+- ROC–AUC: **0.9747**
+- PR–AUC: **0.9306**
+
+All four classifiers (Logistic Regression, Random Forest, Gradient Boosting, XGBoost) reach ROC–AUC values around **0.97** on the validation set, which suggests that the HTRU2 dataset is relatively easy to separate using the chosen features.
+
+**Top features for the selected Random Forest model:**
 
 1. `ip_kurtosis`
-2. `ip_skewness`
-3. `dm_std`
+2. `ip_mean`
+3. `ip_skewness`
 
-See full report in `docs/MODEL_PERFORMANCE.md`.
+![](./outputs/screenshot/feature_importances_random_forest.png)
+
+See the full report in `docs/MODEL_PERFOMANCE.md`.
 
 ---
 
@@ -400,6 +411,6 @@ This project is licensed under the MIT License - see the [LICENSE](./LICENSE) fi
 
 ---
 
-*Last Updated: 2025-12-02*  
-*Last Pipeline Execution: 2025-11-18 01:33:06*
+*Last Updated: 08-12-2025*  
+*Last Pipeline Execution: 07-12-2025*
 *Author: @mchadolias*
