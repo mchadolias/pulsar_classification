@@ -1,14 +1,16 @@
-## 🐳 Model Deployment
+# 🐳 Model Deployment
 
-### Quick Deployment
+## Quick Deployment
 
-#### 1a. Build Docker Image
+### 1a. Build Docker Image
 
 ```bash
-docker build -t pulsar-classification-api:latest .
+docker build -t detect-pulsar-api:latest .
 ```
 
-#### 1b. Pull Docker Image from GitHub project
+**Detail:** Rename the model you want to the appropriate name `best_model.pkl`
+
+### 1b. Pull Docker Image from GitHub project
 
 In case this method is used, modify the name of the image you are using for the following steps accordingly.
 
@@ -19,10 +21,10 @@ docker pull ghcr.io/mchadolias/<project-name>:<tag>
 #### 2. Run Container
 
 ```bash
-docker run -it -p 9696:9696 pulsar-classification-api:latest
+docker run -it -p 9696:9696 detect-pulsar-api:latest
 ```
 
-#### 3. Verify Health
+### 3. Verify Health
 
 ```bash
 curl http://localhost:9696/health

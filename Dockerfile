@@ -1,6 +1,10 @@
 # Stage 1: Builder
 FROM python:3.13-slim AS builder
 
+LABEL authors="Michael Chadolias" \
+    description="Docker image for machine learning training and deployment." \
+    maintainer="@mchadolias"
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 

@@ -8,46 +8,20 @@ import pandas as pd
 from typing import List
 from datetime import datetime
 
-MODEL_PATH = "models/best_xgboost_model.pkl"
-
+MODEL_PATH = "models/best_model.pkl"
+THRESHOLD = 0.36  # Optimal threshold from the latest evaluation (≈0.3617)
 
 app = FastAPI(
     title="🌌 Pulsar Star Classification API",
-    description="""## Pulsar Detection Machine Learning API
-
-    🔭 **Identify pulsar stars from radio telescope data with >96% accuracy**
-    
-    ### 🚀 Features
-    - Single & batch predictions
-    - Real-time probability scores  
-    - Feature importance analysis
-    - RESTful API endpoints
-    
-    ### 📊 Model Performance
-    | Metric | Score | Interpretation |
-    |--------|-------|----------------|
-    | **ROC-AUC** | 0.9768 | Excellent discrimination |
-    | **Recall** | 86.3% | High pulsar detection rate |
-    | **F1-Score** | 89.3% | Balanced performance |
-    | **Precision** | 92.5% | Low false positive rate |
-    
-    ### 🔬 Technical Details
-    - **Dataset**: HTRU2 Pulsar Dataset (17,898 samples)
-    - **Best Model**: XGBoost Classifier
-    - **Class Distribution**: 90.8% non-pulsars / 9.2% pulsars
-    - **Deployment**: FastAPI + Docker
-    
-    ---
-    *For detailed documentation, visit the endpoints below.*
-    """,
     version="1.2.0",
     contact={
         "name": "Michael Chadolias",
-        "url": "https://github.com/mchadolias/pulsar_classification",
+        "url": "https://github.com/mchadolias/detect-pulsar-api",
     },
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
 
 with open(MODEL_PATH, "rb") as f:
     model = pickle.load(f)
@@ -268,21 +242,21 @@ def predict_single_sample(payload: HTRUInputSingle) -> PredictionResponse:
 
     ## 💡 Performance Notes
 
-    - **High Accuracy**: ROC-AUC 0.9768 on test data
-    - **Recall Focus**: 86.3% of actual pulsars correctly identified
-    - **Low False Positives**: 92.5% precision rate
+    - **High ROC–AUC**: 0.9747 on the held-out test set
+    - **Recall-focused**: F₂-score 0.8923 and recall 0.8994 at threshold ≈ 0.36
+    - **Balanced performance**: F₁-score 0.8819 with precision 0.8651
     - **Fast Inference**: Real-time prediction capabilities
 
     ## 🎯 Interpretation Guide
 
-    - **Probability ≥ 0.5**: Classified as pulsar (`is_pulsar: true`)
-    - **Probability < 0.5**: Classified as non-pulsar (`is_pulsar: false`)
+    - **Probability ≥ 0.36**: Classified as pulsar (`is_pulsar: true`)
+    - **Probability < 0.36**: Classified as non-pulsar (`is_pulsar: false`)
     - **Confidence Levels**:
-      - 0.9-1.0: High confidence pulsar
-      - 0.7-0.9: Moderate confidence pulsar
-      - 0.5-0.7: Low confidence pulsar
-      - 0.3-0.5: Possible non-pulsar
-      - 0.0-0.3: High confidence non-pulsar
+      - 0.8-1.0: High confidence pulsar
+      - 0.6-0.8: Moderate confidence pulsar
+      - 0.36-0.6: Borderline / low-confidence pulsar
+      - 0.2-0.36: Borderline non-pulsar
+      - 0.0-0.2: High confidence non-pulsar
 
     ## 🔬 Test Cases
 
@@ -292,7 +266,10 @@ def predict_single_sample(payload: HTRUInputSingle) -> PredictionResponse:
     """
     try:
         probability = predict_single(payload.features)
-        return PredictionResponse(probability=probability, is_pulsar=probability >= 0.5)
+        return PredictionResponse(
+            probability=probability,
+            is_pulsar=probability >= THRESHOLD,
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {str(e)}")
 
@@ -350,26 +327,28 @@ def predict_batch_samples(payload: HTRUInputBatch) -> BatchPredictionResponse:
 
     ## 💡 Performance Notes
 
-    - **Efficient Processing**: Batch predictions are optimized for multiple samples
-    - **Same Accuracy**: Maintains >96% ROC-AUC performance as single predictions
+    - **Same Metrics**: Batch mode uses the same Random Forest model and threshold (≈ 0.36)
+    - **Test Set**: F₂ = 0.8923, F₁ = 0.8819, ROC–AUC = 0.9747, PR–AUC = 0.9306
     - **Order Preservation**: Response order exactly matches input sample order
     - **Ideal Use Cases**: Processing multiple telescope observations, dataset validation
 
     ## 🎯 Interpretation Guide
 
-    - **Probability ≥ 0.5**: Classified as pulsar (`is_pulsar: true`)
-    - **Probability < 0.5**: Classified as non-pulsar (`is_pulsar: false`)
+    - **Probability ≥ 0.36**: Classified as pulsar (`is_pulsar: true`)
+    - **Probability < 0.36**: Classified as non-pulsar (`is_pulsar: false`)
     - **Confidence Levels**:
-      - 0.9-1.0: High confidence pulsar
-      - 0.7-0.9: Moderate confidence pulsar
-      - 0.5-0.7: Low confidence pulsar
-      - 0.3-0.5: Possible non-pulsar
-      - 0.0-0.3: High confidence non-pulsar
+      - 0.8-1.0: High confidence pulsar
+      - 0.6-0.8: Moderate confidence pulsar
+      - 0.36-0.6: Borderline / low-confidence pulsar
+      - 0.2-0.36: Borderline non-pulsar
+      - 0.0-0.2: High confidence non-pulsar
+
     """
     try:
         probabilities = predict_batch(payload.samples)
         predictions = [
-            PredictionResponse(probability=prob, is_pulsar=prob >= 0.5) for prob in probabilities
+            PredictionResponse(probability=prob, is_pulsar=prob >= THRESHOLD)
+            for prob in probabilities
         ]
         return BatchPredictionResponse(predictions=predictions)
     except Exception as e:
@@ -383,16 +362,21 @@ async def health_check():
         "model_loaded": True,
         "version": "2.0.0",
         "timestamp": datetime.now().isoformat(),
+        "imbalance_treatment": "cost-sensitive learning with class weights",
         "performance": {
-            "roc_auc": 0.9768,
-            "recall": 0.8628,
-            "f1_score": 0.8927,
-            "precision": 0.925,  # Calculated from your confusion matrix
+            "threshold": THRESHOLD,
+            "f2_score": 0.8923,
+            "f1_score": 0.8819,
+            "recall": 0.8994,
+            "precision": 0.8651,
+            "roc_auc": 0.9747,
+            "pr_auc": 0.9306,
         },
         "dataset_info": {
             "total_samples": 17898,
             "class_distribution": {"non_pulsars": 0.9084, "pulsars": 0.0916},
             "imbalance_ratio": "9.9:1",
+            "background": "HTRU2 Pulsar Dataset",
         },
     }
 
@@ -604,7 +588,7 @@ async def read_root():
     <body>
         <div class="header">
             <h1>🌌 Pulsar Star Classification API</h1>
-            <p>Machine Learning API for detecting pulsar stars with >92% precision!</p>
+            <p>Machine Learning API for detecting pulsar stars with high recall and ROC–AUC ≈ 0.97</p>
         </div>
         
         <div class="card">
@@ -617,27 +601,27 @@ async def read_root():
         </div>
         
         <div class="card">
-            <h2>📊 Model Performance</h2>
+            <h2>📊 Model Performance (Test Set)</h2>
             <div class="metrics">
                 <div class="metric-card">
-                    <h3>ROC-AUC</h3>
-                    <p>0.9768</p>
-                    <small>Area Under Curve</small>
+                    <h3>F₂-score</h3>
+                    <p>0.8923</p>
+                    <small>Recall-focused metric</small>
                 </div>
                 <div class="metric-card">
                     <h3>Recall</h3>
-                    <p>86.3%</p>
-                    <small>Pulsars Detected</small>
-                </div>
-                <div class="metric-card">
-                    <h3>F1-Score</h3>
-                    <p>89.3%</p>
-                    <small>Balance Measure</small>
+                    <p>89.9%</p>
+                    <small>Pulsars detected</small>
                 </div>
                 <div class="metric-card">
                     <h3>Precision</h3>
-                    <p>92.5%</p>
-                    <small>Correct Pulsar IDs</small>
+                    <p>86.5%</p>
+                    <small>Correct pulsar IDs</small>
+                </div>
+                <div class="metric-card">
+                    <h3>ROC–AUC</h3>
+                    <p>0.9747</p>
+                    <small>Discrimination power</small>
                 </div>
             </div>
         </div>
@@ -663,7 +647,7 @@ async def read_root():
         
         <div class="card">
             <h2>🔬 Technical Details</h2>
-            <p><strong>Model:</strong> XGBoost Classifier</p>
+            <p><strong>Model:</strong> Random Forest classifier (threshold ≈ 0.36, F₂-optimised)</p>
             <p><strong>Dataset:</strong> HTRU2 Pulsar Dataset (17,898 samples)</p>
             <p><strong>Features:</strong> 8 radio telescope measurements</p>
             <p><strong>Deployment:</strong> Docker + FastAPI</p>
@@ -673,8 +657,8 @@ async def read_root():
         <div class="card">
             <h2>📁 GitHub Project</h2>
             <p><strong>Repository:</strong> 
-                <a href="https://github.com/mchadolias/pulsar_classification" target="_blank" style="color: #4CAF50;">
-                    github.com/mchadolias/pulsar_classification
+                <a href="https://github.com/mchadolias/detect-pulsar-api" target="_blank" style="color: #4CAF50;">
+                    github.com/mchadolias/detect-pulsar-api
                 </a>
             </p>
             <p><strong>Description:</strong> ML classification for pulsar detection from radio telescope data</p>
@@ -686,10 +670,10 @@ async def read_root():
                 <li>Comprehensive documentation and examples</li>
             </ul>
             <div style="margin-top: 15px;">
-                <a href="https://github.com/mchadolias/pulsar_classification" target="_blank" class="btn" style="background: #333; color: white;">
+                <a href="https://github.com/mchadolias/detect-pulsar-api" target="_blank" class="btn" style="background: #333; color: white;">
                     📂 View on GitHub
                 </a>
-                <a href="https://github.com/mchadolias/pulsar_classification/issues" target="_blank" class="btn" style="background: #6e5494; color: white;">
+                <a href="https://github.com/mchadolias/detect-pulsar-api/issues" target="_blank" class="btn" style="background: #6e5494; color: white;">
                     🐛 Report Issues
                 </a>
             </div>
